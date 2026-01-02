@@ -4,26 +4,31 @@ from dotenv import load_dotenv
 import requests
 import pandas as pd
 import numpy as np
+from enum import Enum
 
-today = date.today()
+
+class SeasonMode(Enum):
+    TRANSITION = 0  # transition oct 2 - dec 1
+    WINTER = 1      # winter mode dec 2 - march 30
+    SUMMER = 2      # summer mode march 31 - oct 1
 
 
-# pick op mode (summer, winter, transition)
-def season_mode(date_today):
+# pick op season_mode
+def decide_season_mode(date_today):
     m, d = date_today.month, date_today.day
     if (m == 3 and d == 31) or (4 <= m <= 9) or (m == 10 and d == 1):
-        return 1    # summer mode march 31 - oct 1
+        return SeasonMode.SUMMER
     elif (m == 12 and d >= 2) or (m in [1, 2]) or (m == 3 and d <= 30):
-        return 2    # winter mode dec 2 - march 30
+        return SeasonMode.WINTER
     else:
-        return 0    # transition oct 2 - dec 1
-    # TODO: enum?
+        return SeasonMode.TRANSITION
 
 
 # load agsi api key
 def load_api_key():
     load_dotenv()  # reads .env into memory
     api_key = os.getenv("AGSI_API_KEY")     # gets environment variables
+    # load_dotenv() looks for .env in the same path as this file, gotta specify path if testing in console
 
     if not api_key:
         raise RuntimeError("AGSI API key not found.")
@@ -31,12 +36,12 @@ def load_api_key():
 
 
 # fetch data from agsi
-def fetch_data(date_today, mode) -> list[dict]:
+def fetch_data(date_today, season_mode) -> list[dict]:
     base_url = "https://agsi.gie.eu/api"
 
     # search params
     end_date = date_today - timedelta(days=1)
-    if mode == 0:   # fetches 2 months of data for transition period, otherwise 2 weeks
+    if season_mode is SeasonMode.TRANSITION:   # fetches 2 months of data for transition period, otherwise 2 weeks
         start_date = date_today - timedelta(days=62)
     else:
         start_date = date_today - timedelta(days=15)
@@ -91,11 +96,12 @@ def extract_data(data):
         "tech_capacity": [data.loc[0, 'workingGasVolume']],  # in TWh
         "current_storage": [data.loc[0, 'gasInStorage']],    # in TWh
     })
-    st_flow = data.loc[:14, 'injection', 'withdrawal']       # in GWh
+    st_flow = data.loc[:14, ['injection', 'withdrawal']]       # in GWh
     return st_spec, st_flow
 
 
-def calculate_summer(st_spec, st_flow):
+def calculate_summer(data):
+    st_spec, st_flow = extract_data(data)
     current_storage = st_spec.loc[0, "current_storage"]     # in TWh
     tech_capacity = st_spec.loc[0, "tech_capacity"]         # in TWh
     gas_day = pd.to_datetime(st_spec.loc[0, "gas_day"])     # current gas day
@@ -108,12 +114,12 @@ def calculate_summer(st_spec, st_flow):
     days_to_dec1 = (dec1 - gas_day).days
 
     injection7 = st_flow["injection"].iloc[:7].mean()
-    injection14 = st_flow["injection"].mean()
+    injection14 = st_flow["injection"].iloc[:14].mean()
     withdrawal7 = st_flow["withdrawal"].iloc[:7].mean()
-    withdrawal14 = st_flow["withdrawal"].mean()
+    withdrawal14 = st_flow["withdrawal"].iloc[:14].mean()
 
     # all following flows in GWh
-    # calculations assume net injection regime (injection > withdrawal)  # TODO: what if low/no injections?
+    # calculations assume net injection regime (injection > withdrawal)
 
     # How many days left until policy goal fulfilled?
     days_to_goal7 = (tech_capacity * factor - current_storage) * 1000 / (injection7 - withdrawal7)
@@ -147,7 +153,8 @@ def calculate_summer(st_spec, st_flow):
     return summer_data, policy_dates
 
 
-def calculate_winter(st_spec, st_flow):
+def calculate_winter(data):
+    st_spec, st_flow = extract_data(data)
     current_storage = st_spec.loc[0, "current_storage"] * 1000      # in GWh
     gas_day = pd.to_datetime(st_spec.loc[0, "gas_day"])             # current gas day
 
@@ -160,7 +167,7 @@ def calculate_winter(st_spec, st_flow):
     days_to_eow = (eow - gas_day).days
     max_withdrawal_eow = current_storage / days_to_eow
     withdrawal7 = st_flow["withdrawal"].iloc[:7].mean()
-    withdrawal14 = st_flow["withdrawal"].mean()
+    withdrawal14 = st_flow["withdrawal"].iloc[:14].mean()
 
     # How many days of coverage left assuming no more injections?
     days_of_cover7 = current_storage / withdrawal7
@@ -188,33 +195,70 @@ def calculate_winter(st_spec, st_flow):
     return winter_data
 
 
-def pick_season(mode, st_spec, st_flow):
-    if mode == 1:
-        return calculate_summer(st_spec, st_flow)
-    elif mode == 2:
-        return calculate_winter(st_spec, st_flow)
+# check if policy goal (storage >=90%) reached on any day in dataset
+def check_policy_goal(data):
+    goal_reached = (data['full'] >= 90).any()
+    return goal_reached   # true/false
+
+
+# determine the earliest day from dataset when 90% reached
+def first_hit_date(data):
+    hit_date = data.loc[data['full'] >= 90, 'gasDayEnd'].min()
+    return hit_date
+
+
+# decides what to calculate
+def decide_calculation(season_mode, goal_reached):
+    if season_mode is SeasonMode.WINTER:
+        return 'W'
+    elif season_mode is SeasonMode.SUMMER:
+        return None if goal_reached else 'S'
     else:
-        return
-    # TODO: logic for Sept-Dec 1
-    # TODO: summer returns 2 objects, winter 1 -> resolve. do i even have to resolve it tho?
-# run summer calc from march 31? fixed winter from dec 1 to march 30.
-# transition window from mid-sept to dec 1 depends on 90% target.
-# i might need to separate "date categorization" and "transition season determination".
+        return 'W' if goal_reached else 'S'
 
 
-def save_excel():
-    return
+# calculates outputs
+def calculate_report_content(report_mode, data):
+    """
+        Returns:
+          - winter: (winter_data)
+          - summer active: (summer_data, policy_dates)
+          - summer complete: (first_hit_date)
+    """
+    if report_mode == 'W':
+        return calculate_winter(data)
+    elif report_mode == 'S':
+        return calculate_summer(data)
+    else:
+        return first_hit_date(data)
+
+def save_excel(date_today, report_mode, data, report_content):
+    # TODO: add date to file name
+    with pd.ExcelWriter("gas_storage_report.xlsx", engine="xlsxwriter") as writer:
+        data.to_excel(writer, sheet_name="api_data", index=False)
+
+        if report_mode == 'W':
+            report_content.to_excel(writer, sheet_name="calculated_results", index=True)    # TODO: separate constraints
+        elif report_mode == 'S':
+            summer_data, policy_dates = report_content
+            policy_dates.to_excel(writer, sheet_name="calculated_results", startrow=0, index=False)
+            summer_data.to_excel(writer, sheet_name="results", startrow=len(policy_dates) + 3, index=False)
 
 
-def save_pdf():
+def save_pdf(season_mode, report_content, issues):  # TODO: make pdf
+#    for issue in issues:
+#        print("WARNING:", issue)
     return
 
 
 def main():
-#    issues = check_data(data, today)
-#    for issue in issues:
-#        print("WARNING:", issue)
-
+    today = date.today()
+    season_mode = decide_season_mode(today)
+    data_json = fetch_data(today, season_mode)
+    data = to_dataframe(data_json)
+    issues = check_data(data, today)
+    goal_reached = check_policy_goal(data)
+    # TODO: finish main()
     return
 
 
