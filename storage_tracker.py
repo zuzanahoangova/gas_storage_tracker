@@ -1,8 +1,9 @@
+from datetime import date, timedelta
+import os
+from dotenv import load_dotenv
+import requests
 import pandas as pd
 import numpy as np
-import os
-import requests
-from datetime import date, timedelta
 
 today = date.today()
 
@@ -16,37 +17,81 @@ def season_mode(date_today):
         return 2    # winter mode dec 2 - march 30
     else:
         return 0    # transition oct 2 - dec 1
+    # TODO: enum?
+
+
+# load agsi api key
+def load_api_key():
+    load_dotenv()  # reads .env into memory
+    api_key = os.getenv("AGSI_API_KEY")     # gets environment variables
+
+    if not api_key:
+        raise RuntimeError("AGSI API key not found.")
+    return api_key
 
 
 # fetch data from agsi
-def fetch_data(mode, dunno):  # TODO: learn API
-    # TODO: save in current folder as default but implement choose
-    return
+def fetch_data(date_today, mode) -> list[dict]:
+    base_url = "https://agsi.gie.eu/api"
+
+    # search params
+    end_date = date_today - timedelta(days=1)
+    if mode == 0:   # fetches 2 months of data for transition period, otherwise 2 weeks
+        start_date = date_today - timedelta(days=62)
+    else:
+        start_date = date_today - timedelta(days=15)
+
+    params = {
+        "country": "CZ",
+        "from": start_date.isoformat(),
+        "to": end_date.isoformat(),
+    }
+
+    # authentication
+    api_key = load_api_key()
+    headers = {"x-key": api_key}
+
+    # data fetch
+    r = requests.get(base_url, params=params, headers=headers)
+    r.raise_for_status()
+
+    payload = r.json()
+    raw_json = payload["data"] if isinstance(payload, dict) else payload
+    return raw_json
 
 
-# load data from same folder
-def load_data(filename):
-    data = pd.read_json(filename)
+# convert json data to pandas dataframe
+def to_dataframe(raw_json: list[dict]) -> pd.DataFrame:
+    data = pd.DataFrame(raw_json)
     return data
 
 
-# check for missing data
-def check_data(data):   # TODO: do a data check (correct date, no missing days etc.)
-    return
-# give a warning window with missing data and let decide if proceed or not.
-# or maybe just proceed anyways and just list what data is missing?
+# check for issues in data
+def check_data(data, date_today):
+    issues = []
+    dates = pd.to_datetime(data['gasDayEnd'])
+    end_date = pd.Timestamp(date_today - timedelta(days=1))
+
+    # checks latest date
+    if dates.iloc[0] != end_date:
+        issues.append(f"Latest gasDayEnd is {dates.iloc[0].date()}, expected {end_date.date()}.")
+
+    # checks missing days
+    expected = pd.date_range(start=dates.min(), end=dates.max(), freq="D")
+    missing = expected.difference(dates)
+    if not missing.empty:
+        issues.append(f"Missing {len(missing)} gas days: {missing.date.tolist()}.")
+    return issues
 
 
 # clean data
 def extract_data(data):
-    data = data.iloc[:14]
     st_spec = pd.DataFrame({
-        "gas_day": [data.iloc[0, 2]],               # current day as string
-        "tech_capacity": [data.iloc[0, 10]],        # in TWh
-        "current_storage": [data.iloc[0, 3]],       # in TWh
+        "gas_day": [data.loc[0, 'gasDayEnd']],               # current day as string
+        "tech_capacity": [data.loc[0, 'workingGasVolume']],  # in TWh
+        "current_storage": [data.loc[0, 'gasInStorage']],    # in TWh
     })
-    st_flow = data.iloc[:, [8, 9]]
-    st_flow.columns = ["injection", "withdrawal"]   # in GWh
+    st_flow = data.loc[:14, 'injection', 'withdrawal']       # in GWh
     return st_spec, st_flow
 
 
@@ -122,7 +167,7 @@ def calculate_winter(st_spec, st_flow):
     days_of_cover14 = current_storage / withdrawal14
 
     if np.isinf(days_of_cover7):
-        end_date7 = pd.NaT
+        end_date7 = pd.NaT  # no end date if 0 withdrawal over 7 days
     else:
         end_date7 = gas_day + pd.Timedelta(days=np.floor(days_of_cover7))
 
@@ -166,6 +211,10 @@ def save_pdf():
 
 
 def main():
+#    issues = check_data(data, today)
+#    for issue in issues:
+#        print("WARNING:", issue)
+
     return
 
 
