@@ -8,6 +8,10 @@ from datetime import date, datetime, timedelta, timezone
 import subprocess
 from pathlib import Path
 from jinja2 import Template
+import shutil
+
+if shutil.which("wkhtmltopdf") is None:
+    raise RuntimeError("wkhtmltopdf is required but not installed or not on PATH.")
 
 
 HTML_TEMPLATE = """
@@ -75,7 +79,6 @@ class SeasonMode(Enum):
     SUMMER = 2      # summer mode march 31 - oct 1
 
 
-# pick op season_mode
 def decide_season_mode(date_today):
     m, d = date_today.month, date_today.day
     if (m == 3 and d == 31) or (4 <= m <= 9) or (m == 10 and d == 1):
@@ -86,7 +89,6 @@ def decide_season_mode(date_today):
         return SeasonMode.TRANSITION
 
 
-# load agsi api key
 def load_api_key():
     load_dotenv()  # reads .env into memory
     api_key = os.getenv("AGSI_API_KEY")     # gets environment variables
@@ -97,7 +99,6 @@ def load_api_key():
     return api_key
 
 
-# fetch data from agsi
 def fetch_data(date_today, season_mode) -> list[dict]:
     base_url = "https://agsi.gie.eu/api"
 
@@ -125,26 +126,28 @@ def fetch_data(date_today, season_mode) -> list[dict]:
 
     payload = r.json()
     raw_json = payload["data"] if isinstance(payload, dict) else payload
+
+    size = params["size"]
+    if len(raw_json) == size:
+        raise RuntimeError("API response hit page size limit; data may be truncated.")
+
     return raw_json
 
 
-# correct data types
 def normalize_dtypes(df: pd.DataFrame) -> pd.DataFrame:
-    numeric_cols = df.columns.difference(["status", "gasDayStart", "gasDayEnd"])
-    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
-    df["gasDayStart"] = pd.to_datetime(df["gasDayStart"], errors="coerce")
-    df["gasDayEnd"] = pd.to_datetime(df["gasDayEnd"], errors="coerce")
+    numeric_cols = df.columns.difference(["gasDayEnd"])
+    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric)
+    df["gasDayEnd"] = pd.to_datetime(df["gasDayEnd"])
     return df
 
 
-# convert json data to pandas dataframe
 def create_dataframe(raw_json: list[dict]) -> pd.DataFrame:
     data = pd.DataFrame(raw_json)
+    data = data[['gasDayEnd', 'full', 'gasInStorage', 'injection', 'withdrawal', 'workingGasVolume']]
     data = normalize_dtypes(data)
     return data
 
 
-# check for issues in data
 def check_data(data, date_today):
     issues = []
     dates = data['gasDayEnd']
@@ -162,7 +165,6 @@ def check_data(data, date_today):
     return issues
 
 
-# clean data
 def extract_data(data):
     st_spec = pd.DataFrame({
         "gas_day": [data.loc[0, 'gasDayEnd']],               # current day as string
@@ -201,8 +203,12 @@ def calculate_summer(data):
     goal_date14 = gas_day + pd.Timedelta(days=np.ceil(days_to_goal14))
 
     # What minimal injection rate is needed to reach policy goal based on recent withdrawal rate?
-    min_inj_nov1_7 = (tech_capacity * factor - current_storage) * 1000 / days_to_nov1 + withdrawal7
-    min_inj_nov1_14 = (tech_capacity * factor - current_storage) * 1000 / days_to_nov1 + withdrawal14
+    if days_to_nov1 > 0:
+        min_inj_nov1_7 = (tech_capacity * factor - current_storage) * 1000 / days_to_nov1 + withdrawal7
+        min_inj_nov1_14 = (tech_capacity * factor - current_storage) * 1000 / days_to_nov1 + withdrawal14
+    else:
+        min_inj_nov1_7 = None
+        min_inj_nov1_14 = None
     min_inj_dec1_7 = (tech_capacity * factor - current_storage) * 1000 / days_to_dec1 + withdrawal7
     min_inj_dec1_14 = (tech_capacity * factor - current_storage) * 1000 / days_to_dec1 + withdrawal14
 
@@ -268,19 +274,16 @@ def calculate_winter(data):
     return winter_data
 
 
-# check if policy goal (storage >=90%) reached on any day in dataset
 def check_policy_goal(data):
     goal_reached = (data['full'] >= 90).any()
     return goal_reached   # true/false
 
 
-# determine the earliest day from dataset when 90% reached
 def first_hit_date(data):
     hit_date = data.loc[data['full'] >= 90, 'gasDayEnd'].min()
     return hit_date
 
 
-# decides what to calculate
 def decide_calculation(season_mode, goal_reached):
     if season_mode is SeasonMode.WINTER:
         return 'W'
@@ -290,7 +293,6 @@ def decide_calculation(season_mode, goal_reached):
         return 'W' if goal_reached else 'S'
 
 
-# calculates outputs
 def calculate_report_content(report_mode, data):
     """
         Returns:
@@ -318,8 +320,7 @@ def write_branch(writer, table1, table2):
     worksheet.write(1, 0, "all flows in GWh")
 
 
-# save input and output data to excel file
-def save_excel(report_mode, data, report_content):
+def save_excel(report_mode, data, report_content):  # saves both input and output data
     now = datetime.now(timezone.utc)    # UTC for auditability
     timestamp = now.strftime("%Y-%m-%d_%H%M%S_UTC")
     filename = f"Gas_Storage_Report_{timestamp}.xlsx"
@@ -343,8 +344,11 @@ def save_excel(report_mode, data, report_content):
 def render_pdf(html: str, output_path: str):
     tmp_html = Path("_temp_report.html")
     tmp_html.write_text(html, encoding="utf-8")
-    subprocess.run(["wkhtmltopdf", "--encoding", "utf-8", str(tmp_html), output_path],check=True)
-    tmp_html.unlink()
+    try:
+        subprocess.run(["wkhtmltopdf", "--encoding", "utf-8", str(tmp_html), output_path], check=True)
+    finally:
+        if tmp_html.exists():
+            tmp_html.unlink()
 
 
 def save_pdf(report_mode, report_content, issues, data):
@@ -456,10 +460,6 @@ def save_pdf(report_mode, report_content, issues, data):
 
 
 def main():
-    # test dates
-    # today = date(2025, 6, 9)
-    # today = date(2025, 9, 21)
-    # today = date(2025, 11, 9)
     today = date.today()
 
     season_mode = decide_season_mode(today)
